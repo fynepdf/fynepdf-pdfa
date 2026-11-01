@@ -6,5 +6,3 @@ bench/set-e/out/
 bench/node_modules/
 dist/
 npm/out/
-config.bat
-node_modules
