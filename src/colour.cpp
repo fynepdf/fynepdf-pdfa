@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
+#include <random>
 #include <stdexcept>
 #include <cmath>
 #include <map>
@@ -39,6 +41,42 @@ constexpr unsigned long long kMaximumPixelBytes = 256ULL * 1024 * 1024;
 // 2.5 GB photo PDF take 2.3 GB.
 constexpr size_t kRawHeld = 32 * 1024 * 1024;
 
+// 64-bit positions in the temporary file (MSVC has no ftello/fseeko).
+long long Tell(FILE *file) {
+#ifdef _WIN32
+  return _ftelli64(file);
+#else
+  return ftello(file);
+#endif
+}
+int Seek(FILE *file, long long at, int whence) {
+#ifdef _WIN32
+  return _fseeki64(file, at, whence);
+#else
+  return fseeko(file, at, whence);
+#endif
+}
+
+// A temporary file that is deleted when it is closed or the process ends. On Windows tmpfile()
+// makes its file in the drive's root, which a normal user may not write to, so it is made in the
+// user's temporary folder instead, opened "TD" (temporary, delete on close).
+FILE *OpenScratch() {
+#ifdef _WIN32
+  std::error_code error;
+  const std::filesystem::path folder = std::filesystem::temp_directory_path(error);
+  if (!error) {
+    std::random_device random;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+      const std::filesystem::path path =
+          folder / ("fynepdf-" + std::to_string(random()) + "-" + std::to_string(random()) + ".tmp");
+      if (FILE *file = _wfopen(path.c_str(), L"w+bTD"))
+        return file;
+    }
+  }
+#endif
+  return std::tmpfile();
+}
+
 // An unnamed temporary file (the system removes it when the process ends) that held stream data
 // is appended to and read back from.
 class Scratch {
@@ -49,9 +87,9 @@ public:
   }
   // Appends |bytes|; returns where they are.
   std::pair<long long, size_t> Put(const std::string &bytes) {
-    if (std::fseek(file_, 0, SEEK_END) != 0)
+    if (Seek(file_, 0, SEEK_END) != 0)
       throw std::runtime_error("temporary file: seek failed");
-    const long long at = ftello(file_);
+    const long long at = Tell(file_);
     if (!bytes.empty() && std::fwrite(bytes.data(), 1, bytes.size(), file_) != bytes.size())
       throw std::runtime_error("temporary file: write failed (disk full?)");
     return {at, bytes.size()};
@@ -59,7 +97,7 @@ public:
   // Writes the |size| bytes at |at| to |pipeline|, without finishing it.
   void Read(long long at, size_t size, Pipeline *pipeline) {
     std::fflush(file_);
-    if (fseeko(file_, at, SEEK_SET) != 0)
+    if (Seek(file_, at, SEEK_SET) != 0)
       throw std::runtime_error("temporary file: seek failed");
     std::vector<unsigned char> chunk(1 << 20);
     while (size > 0) {
@@ -72,7 +110,7 @@ public:
   }
 
 private:
-  Scratch() : file_(std::tmpfile()) {
+  Scratch() : file_(OpenScratch()) {
     if (!file_)
       throw std::runtime_error("cannot create a temporary file");
   }
