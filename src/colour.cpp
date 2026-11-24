@@ -8,6 +8,10 @@
 #include "pdf_function.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <filesystem>
+#include <random>
+#include <stdexcept>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -29,29 +33,123 @@ using namespace content;
 // The most a picture may take decoded (256 MB): larger ones are left as they are.
 constexpr unsigned long long kMaximumPixelBytes = 256ULL * 1024 * 1024;
 
-// Stream data the converter makes (page content, forms, pictures) stays in memory until the
-// file is written, for the whole file at once. Past kRawHeld bytes of it, the rest is held
-// Flate-compressed and inflated again when the writer asks for it; the writer then compresses
-// it as it always did, so the file comes out the same, byte for byte. Most files make less than
-// that and cost no extra work.
+// Stream data the converter makes (page content, forms, pictures) waits until the file is
+// written, for the whole file at once. The first kRawHeld bytes of it stay in memory; the rest
+// waits on disk (HeldData) and is handed back when the writer asks for it, so the file comes
+// out the same, byte for byte. Most files make less than that and cost no extra work. On disk,
+// memory stays flat however big the file is: holding it all in memory, even compressed, made a
+// 2.5 GB photo PDF take 2.3 GB.
 constexpr size_t kRawHeld = 32 * 1024 * 1024;
 
+// 64-bit positions in the temporary file (MSVC has no ftello/fseeko).
+long long Tell(FILE *file) {
+#ifdef _WIN32
+  return _ftelli64(file);
+#else
+  return ftello(file);
+#endif
+}
+int Seek(FILE *file, long long at, int whence) {
+#ifdef _WIN32
+  return _fseeki64(file, at, whence);
+#else
+  return fseeko(file, at, whence);
+#endif
+}
+
+// A temporary file that is deleted when it is closed or the process ends. On Windows tmpfile()
+// makes its file in the drive's root, which a normal user may not write to, so it is made in the
+// user's temporary folder instead, opened "TD" (temporary, delete on close).
+FILE *OpenScratch() {
+#ifdef _WIN32
+  std::error_code error;
+  const std::filesystem::path folder = std::filesystem::temp_directory_path(error);
+  if (!error) {
+    std::random_device random;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+      const std::filesystem::path path =
+          folder / ("fynepdf-" + std::to_string(random()) + "-" + std::to_string(random()) + ".tmp");
+      if (FILE *file = _wfopen(path.c_str(), L"w+bTD"))
+        return file;
+    }
+  }
+#endif
+  return std::tmpfile();
+}
+
+// An unnamed temporary file (the system removes it when the process ends) that held stream data
+// is appended to and read back from.
+class Scratch {
+public:
+  static Scratch &Get() {
+    static Scratch scratch;
+    return scratch;
+  }
+  // Appends |bytes|; returns where they are.
+  std::pair<long long, size_t> Put(const std::string &bytes) {
+    if (Seek(file_, 0, SEEK_END) != 0)
+      throw std::runtime_error("temporary file: seek failed");
+    const long long at = Tell(file_);
+    if (!bytes.empty() && std::fwrite(bytes.data(), 1, bytes.size(), file_) != bytes.size())
+      throw std::runtime_error("temporary file: write failed (disk full?)");
+    return {at, bytes.size()};
+  }
+  // Writes the |size| bytes at |at| to |pipeline|, without finishing it.
+  void Read(long long at, size_t size, Pipeline *pipeline) {
+    std::fflush(file_);
+    if (Seek(file_, at, SEEK_SET) != 0)
+      throw std::runtime_error("temporary file: seek failed");
+    std::vector<unsigned char> chunk(1 << 20);
+    while (size > 0) {
+      const size_t got = std::fread(chunk.data(), 1, std::min(size, chunk.size()), file_);
+      if (got == 0)
+        throw std::runtime_error("temporary file: read failed");
+      pipeline->write(chunk.data(), got);
+      size -= got;
+    }
+  }
+
+private:
+  Scratch() : file_(OpenScratch()) {
+    if (!file_)
+      throw std::runtime_error("cannot create a temporary file");
+  }
+  ~Scratch() { std::fclose(file_); }
+  FILE *file_;
+};
+
+// A stream's new data, waiting on disk. Deflated: stored Flate-compressed and inflated again
+// for the writer, which then compresses it as it always did (raw pixels, content). As is: the
+// bytes themselves (a picture's JPEG, written with its /DCTDecode filter).
 class HeldData : public QPDFObjectHandle::StreamDataProvider {
 public:
-  explicit HeldData(const std::string &data) {
-    Pl_String sink("held", nullptr, compressed_);
+  enum class Store { Deflated, AsIs };
+  explicit HeldData(const std::string &data, Store store = Store::Deflated) : deflated_(store == Store::Deflated) {
+    if (!deflated_) {
+      at_ = Scratch::Get().Put(data);
+      return;
+    }
+    std::string compressed;
+    Pl_String sink("held", nullptr, compressed);
     Pl_Flate deflate("held", &sink, Pl_Flate::a_deflate);
     deflate.write(reinterpret_cast<const unsigned char *>(data.data()), data.size());
     deflate.finish();
+    at_ = Scratch::Get().Put(compressed);
   }
   void provideStreamData(QPDFObjGen const &, Pipeline *pipeline) override {
+    if (!deflated_) {
+      Scratch::Get().Read(at_.first, at_.second, pipeline);
+      pipeline->finish();
+      return;
+    }
     Pl_Flate inflate("held", pipeline, Pl_Flate::a_inflate);
-    inflate.write(reinterpret_cast<const unsigned char *>(compressed_.data()), compressed_.size());
+    Scratch::Get().Read(at_.first, at_.second, &inflate);
     inflate.finish();
   }
 
 private:
-  std::string compressed_;
+  bool deflated_;
+  std::pair<long long, size_t> at_{0, 0};
 };
 
 enum class Kind { Gray, Rgb, Cmyk, Lab, Indexed, Spot, Pattern, Other };
@@ -1215,7 +1313,7 @@ private:
     std::string jpeg_bytes, converted;
     if (gray_ && kind == Kind::Rgb && last == "/DCTDecode" && !dict.hasKey("/Decode") && !not_ycbcr &&
         Filtered(image, filters.size() - 1, false, jpeg_bytes) && jpeg::GrayFromYCbCr(jpeg_bytes, converted)) {
-      image.replaceStreamData(converted, QPDFObjectHandle::newName("/DCTDecode"), QPDFObjectHandle::newNull());
+      HoldJpeg(image, converted);
       dict.replaceKey("/ColorSpace", QPDFObjectHandle::newName("/DeviceGray"));
       dict.removeKey("/DecodeParms");
       ++stats_.images;
@@ -1253,7 +1351,7 @@ private:
     ++stats_.wrapped;
   }
 
-  // |stream|'s new data, as it is or, past kRawHeld for the file, compressed (HeldData).
+  // |stream|'s new data, in memory or, past kRawHeld for the file, on disk (HeldData).
   void Hold(QPDFObjectHandle stream, const std::string &data) {
     if (raw_held_ + data.size() <= kRawHeld) {
       raw_held_ += data.size();
@@ -1263,13 +1361,24 @@ private:
     }
   }
 
+  // A picture's new JPEG, the same way: in memory within kRawHeld, then on disk as it is.
+  void HoldJpeg(QPDFObjectHandle image, const std::string &jpeg) {
+    if (raw_held_ + jpeg.size() <= kRawHeld) {
+      raw_held_ += jpeg.size();
+      image.replaceStreamData(jpeg, QPDFObjectHandle::newName("/DCTDecode"), QPDFObjectHandle::newNull());
+    } else {
+      image.replaceStreamData(std::make_shared<HeldData>(jpeg, HeldData::Store::AsIs),
+                              QPDFObjectHandle::newName("/DCTDecode"), QPDFObjectHandle::newNull());
+    }
+  }
+
   // A picture's new pixels in the target: a photo that was a JPEG stays one, so the file keeps
   // its size; anything else is written losslessly (qpdf compresses it when the file is written).
   void WriteTarget(QPDFObjectHandle image, const std::string &pixels, int width, int height, bool photo) {
     QPDFObjectHandle dict = image.getDict();
     std::string encoded;
     if (photo && jpeg::Encode(reinterpret_cast<const unsigned char *>(pixels.data()), width, height, static_cast<int>(Out()), quality_, encoded))
-      image.replaceStreamData(encoded, QPDFObjectHandle::newName("/DCTDecode"), QPDFObjectHandle::newNull());
+      HoldJpeg(image, encoded);
     else
       Hold(image, pixels);
     dict.replaceKey("/ColorSpace", QPDFObjectHandle::newName(OutSpace()));
